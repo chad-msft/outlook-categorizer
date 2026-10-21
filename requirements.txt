@@ -1,0 +1,3 @@
+azure-identity
+typesafe-sdk
+pywin32

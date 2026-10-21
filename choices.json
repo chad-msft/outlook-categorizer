@@ -1,0 +1,19 @@
+{
+  "category": {
+    "type": "choice",
+    "instructions": "Which category best describes this content?",
+    "criteria": {
+      "Reminder": "Calendar events that are upcoming in date or time and need reminding'.",
+      "Low Importance": "Content of low importance and is considered 'Low Importance'.",
+      "Super Important": "Content that needs immediate attention and is considered 'Super Important'.",
+      "Personal": "Content that is considered 'Personal'.",
+      "Important": "Content that is considered important.",
+      "Daily": "Content that is related to daily activities or matters.",
+      "Internal Management": "Content that is from an internal email and related to internal Microsoft management or administrative matters.",
+      "Internal Memo": "Content that is from an internal email and related to internal Microsoft content or information.",
+      "Followup": "Content that is time sensitive and needs follow-up.",
+      "External Spam": "Content where the sender is from a domain external to the organization and is considered spam.",
+      "Training": "Content related to training or learning, school activities, or educational content."
+    }
+  }
+}
