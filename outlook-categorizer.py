@@ -1,8 +1,8 @@
-"""Categorize Classic Outlook emails using a JSON Choice question.
+"""Categorize Classic Outlook Inbox emails or Calendar events using a JSON Choice question.
 
 Requires Windows, Classic Outlook, Azure CLI, pywin32, azure-identity, and
 typesafe-sdk. Run with --help for arguments and an example. Azure login runs
-before mailbox access. Exit codes: 0 for success, 1 for login/setup/email
+before mailbox access. Exit codes: 0 for success, 1 for login/setup/item
 errors, and 2 for invalid command-line arguments.
 """
 
@@ -64,15 +64,24 @@ def outlook_sender_smtp_address(email) -> str:
     return address.strip()
 
 
-def log_outlook_email_error(email, index: int, stage: str) -> None:
+def log_outlook_item_error(item, index: int, stage: str, is_calendar: bool) -> None:
     details = {}
-    for field in ("EntryID", "ReceivedTime", "SenderEmailAddress", "Subject"):
+    fields = (
+        ("EntryID", "Start", "End", "Organizer", "Subject")
+        if is_calendar
+        else ("EntryID", "ReceivedTime", "SenderEmailAddress", "Subject")
+    )
+    for field in fields:
         try:
-            details[field] = getattr(email, field)
+            details[field] = getattr(item, field)
         except (pywintypes.com_error, AttributeError) as metadata_error:
             details[field] = f"<unavailable: {metadata_error}>"
     logging.getLogger("outlook_categorization").exception(
-        "Email %d failed while %s; details=%r", index, stage, details
+        "%s %d failed while %s; details=%r",
+        "Calendar event" if is_calendar else "Email",
+        index,
+        stage,
+        details,
     )
 
 
@@ -86,14 +95,15 @@ def login_to_azure(tenant_id: str) -> None:
     )
 
 
-def categorize_outlook_emails(
+def categorize_outlook_items(
     start_at: datetime,
     end_at: datetime,
     category_question: Choice,
     base_url: str,
     tenant_id: str,
+    process_calendar: bool = False,
 ) -> int:
-    """Process uncategorized emails on inclusive local dates; return the error count."""
+    """Process Inbox emails or overlapping Calendar events; return the error count."""
     if start_at > end_at:
         raise ValueError("start_date must be on or before end_date.")
     end_exclusive = end_at + timedelta(days=1)
@@ -101,18 +111,10 @@ def categorize_outlook_emails(
     locale_id = win32api.GetUserDefaultLCID()
     date_shortdate, time_noseconds = 1, 2
 
-    def outlook_utc_literal(value: datetime) -> str:
-        utc_value = value.astimezone(timezone.utc)
-        date_text = win32api.GetDateFormat(locale_id, date_shortdate, utc_value)
-        time_text = win32api.GetTimeFormat(locale_id, time_noseconds, utc_value)
+    def outlook_date_literal(value: datetime) -> str:
+        date_text = win32api.GetDateFormat(locale_id, date_shortdate, value)
+        time_text = win32api.GetTimeFormat(locale_id, time_noseconds, value)
         return f"{date_text} {time_text}"
-
-    # DASL uses UTC boundaries and Windows-localized date/time literals.
-    received_property = '"urn:schemas:httpmail:datereceived"'
-    email_query = (
-        f"@SQL={received_property} >= '{outlook_utc_literal(start_at)}' AND "
-        f"{received_property} < '{outlook_utc_literal(end_exclusive)}'"
-    )
 
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\International") as key:
@@ -126,42 +128,75 @@ def categorize_outlook_emails(
             raise ValueError(f"Category {name!r} contains Outlook's category list separator.")
 
     total = skipped = requests_sent = processed = updated = errors = 0
-
     def print_summary() -> None:
+        item_plural = "Calendar events" if process_calendar else "Emails"
         print("\nCategorization summary")
-        print(f"Total emails in timeframe: {total}")
-        print(f"Emails processed by model: {processed} (requests attempted: {requests_sent})")
+        print(f"Total {item_plural.lower()} in timeframe: {total}")
+        print(
+            f"{item_plural} processed by model: "
+            f"{processed} (requests attempted: {requests_sent})"
+        )
         print(f"Skipped because already categorized: {skipped}")
         print(f"Categories saved: {updated}")
-        print(f"Email errors: {errors}")
+        print(f"{'Calendar event' if process_calendar else 'Email'} errors: {errors}")
 
+    folder_description = "Calendar events" if process_calendar else "Inbox messages"
     try:
         outlook = win32com.client.Dispatch("Outlook.Application")
-        inbox = outlook.GetNamespace("MAPI").GetDefaultFolder(6)
-        items = inbox.Items.Restrict(email_query)
-        items.Sort("[ReceivedTime]", True)
+        namespace = outlook.GetNamespace("MAPI")
+        folders = [(9, 26, True)] if process_calendar else [(6, 43, False)]
 
         # Snapshot uncategorized matches before saving any category changes.
-        emails = []
-        item = items.GetFirst()
-        while item is not None:
-            if item.Class == 43:
-                total += 1
-                try:
-                    if (item.Categories or "").strip():
-                        skipped += 1
-                    else:
-                        emails.append((total, item))
-                except (pywintypes.com_error, AttributeError):
-                    errors += 1
-                    log_outlook_email_error(item, total, "checking existing categories")
-            item = items.GetNext()
-        if not emails:
+        pending_items = []
+        for folder_id, item_class, is_calendar in folders:
+            folder_description = "Calendar events" if is_calendar else "Inbox messages"
+            folder = namespace.GetDefaultFolder(folder_id)
+            if is_calendar:
+                items = folder.Items
+                items.Sort("[Start]")
+                items.IncludeRecurrences = True
+                # Jet compares Start/End in local time; include events spanning either boundary.
+                calendar_query = (
+                    f"[Start] < '{outlook_date_literal(end_exclusive)}' AND "
+                    f"[End] > '{outlook_date_literal(start_at)}'"
+                )
+                items = items.Restrict(calendar_query)
+            else:
+                # DASL uses UTC boundaries and Windows-localized date/time literals.
+                received_property = '"urn:schemas:httpmail:datereceived"'
+                email_query = (
+                    f"@SQL={received_property} >= "
+                    f"'{outlook_date_literal(start_at.astimezone(timezone.utc))}' AND "
+                    f"{received_property} < "
+                    f"'{outlook_date_literal(end_exclusive.astimezone(timezone.utc))}'"
+                )
+                items = folder.Items.Restrict(email_query)
+                items.Sort("[ReceivedTime]", True)
+
+            item = items.GetFirst()
+            while item is not None:
+                if item.Class == item_class:
+                    # Bound enumeration even for recurring series without an end date.
+                    if is_calendar and item.Start.replace(tzinfo=None) >= end_exclusive:
+                        break
+                    total += 1
+                    try:
+                        if (item.Categories or "").strip():
+                            skipped += 1
+                        else:
+                            pending_items.append((total, item, is_calendar))
+                    except (pywintypes.com_error, AttributeError):
+                        errors += 1
+                        log_outlook_item_error(
+                            item, total, "checking existing categories", is_calendar
+                        )
+                item = items.GetNext()
+        if not pending_items:
             print_summary()
             return errors
     except pywintypes.com_error as exc:
         raise RuntimeError(
-            "Could not read Inbox messages. Open Classic Outlook for Windows "
+            f"Could not read {folder_description}. Open Classic Outlook for Windows "
             "and sign in to your mail profile, then rerun this script."
         ) from exc
 
@@ -173,17 +208,26 @@ def categorize_outlook_emails(
             model="Decision-1",
             timeout=60,
         ) as client:
-            for index, email in emails:
+            for index, item, is_calendar in pending_items:
+                item_name = "Calendar event" if is_calendar else "Email"
                 stage = "checking existing categories"
                 try:
-                    if (email.Categories or "").strip():
+                    if (item.Categories or "").strip():
                         skipped += 1
                         continue
                     stage = "reading the classification payload"
-                    sender_email = outlook_sender_smtp_address(email)
-                    subject = email.Subject or ""
-                    body_preview = (email.Body or "")[:1024]
-                    state = f"Sender: {sender_email}\nSubject: {subject}\nBody: {body_preview}"
+                    subject = item.Subject or ""
+                    body_preview = (item.Body or "")[:1024]
+                    if is_calendar:
+                        state = (
+                            f"Organizer: {item.Organizer or ''}\nSubject: {subject}\n"
+                            f"Start: {item.Start}\nEnd: {item.End}\n"
+                            f"All-day: {item.AllDayEvent}\nLocation: {item.Location or ''}\n"
+                            f"Body: {body_preview}"
+                        )
+                    else:
+                        sender_email = outlook_sender_smtp_address(item)
+                        state = f"Sender: {sender_email}\nSubject: {subject}\nBody: {body_preview}"
                     stage = "requesting model categorization"
                     requests_sent += 1
                     response = client.system_one(
@@ -196,23 +240,29 @@ def categorize_outlook_emails(
                     if selected not in category_criteria:
                         raise ValueError(f"Model returned an unknown configured category: {selected!r}")
                     if not 0.0 <= answer.confidence <= 1.0:
-                        raise ValueError(f"Invalid category confidence for email {index}: {answer.confidence!r}")
+                        raise ValueError(
+                            f"Invalid category confidence for {item_name.lower()} {index}: "
+                            f"{answer.confidence!r}"
+                        )
                     processed += 1
 
                     stage = "saving the selected category"
-                    if (email.Categories or "").strip():
+                    if (item.Categories or "").strip():
                         status = "Categorized during model request; unchanged"
                     else:
-                        email.Categories = selected
-                        email.Save()
+                        item.Categories = selected
+                        item.Save()
                         updated += 1
                         status = "Category assigned and saved"
                 except (pywintypes.com_error, TypeSafeError, ValueError, KeyError, AttributeError):
                     errors += 1
-                    log_outlook_email_error(email, index, stage)
+                    log_outlook_item_error(item, index, stage, is_calendar)
                     continue
+                display_subject = subject or "(no subject)"
+                if process_calendar:
+                    display_subject = f"{item_name}: {display_subject}"
                 print(
-                    f"{index:2}. {subject or '(no subject)'}\n"
+                    f"{index:2}. {display_subject}\n"
                     f"    Category: {selected} | Confidence: {answer.confidence:.1%} | {status}"
                 )
 
@@ -256,21 +306,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Sign in to Azure, then categorize uncategorized Classic Outlook Inbox emails "
-            "using a JSON Choice question. Running this script saves email categories."
+            "or Calendar events using a JSON Choice question. "
+            "Running this script saves item categories."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Requires Windows, Classic Outlook signed in, and Azure CLI on PATH.\n"
             "Python dependencies (from the repository root):\n"
-            "  python -m pip install -r script\\requirements.txt\n\n"
+            "  python -m pip install -r .\\requirements.txt\n\n"
             "Example from the repository root:\n"
-            "  python script\\outlook-categorizer.py "
-            '--base-url "https://cschult-openai.services.ai.azure.com/providers/microsoft" '
+            "  python .\\outlook-categorizer.py "
+            '--base-url "https://YOUR-RESOURCE.services.ai.azure.com/providers/microsoft" '
             '--choices-path ".\\choices.json" --start-date 2026-07-01 '
             '--end-date 2026-07-31 --tenant-id "YOUR-TENANT-ID"\n\n'
             "Runs az login --tenant TENANT_ID before accessing Outlook.\n"
             "Dates are inclusive in the Windows local time zone. Existing categories are skipped.\n"
-            "Exit codes: 0 success; 1 login, setup, or per-email errors; 2 invalid arguments."
+            "Use --process-calendar to categorize overlapping Calendar events instead of Inbox emails.\n"
+            "Exit codes: 0 success; 1 login, setup, or per-item errors; 2 invalid arguments."
         ),
     )
     parser.add_argument("--base-url", required=True, type=base_url_argument, help="Decisions HTTPS base URL.")
@@ -283,6 +335,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-date", required=True, type=date_argument, help="First local date, YYYY-MM-DD.")
     parser.add_argument("--tenant-id", required=True, type=tenant_argument, help="Azure tenant ID or tenant domain.")
     parser.add_argument("--end-date", required=True, type=date_argument, help="Last local date, YYYY-MM-DD.")
+    parser.add_argument(
+        "--process-calendar",
+        action="store_true",
+        help=(
+            "Categorize default Calendar events instead of Inbox emails, "
+            "overlapping the inclusive local date range."
+        ),
+    )
     return parser
 
 
@@ -297,12 +357,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         category_question = load_category_choice(args.choices_path.expanduser().resolve())
         login_to_azure(args.tenant_id)
-        errors = categorize_outlook_emails(
+        errors = categorize_outlook_items(
             start_at=args.start_date,
             end_at=args.end_date,
             category_question=category_question,
             base_url=args.base_url,
             tenant_id=args.tenant_id,
+            process_calendar=args.process_calendar,
         )
     except (AzureError, OSError, RuntimeError, TypeSafeError, ValueError, subprocess.CalledProcessError):
         logging.getLogger("outlook_categorization").exception("Outlook categorization failed.")

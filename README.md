@@ -1,7 +1,8 @@
 # Outlook Categorizer
 
 A Python command-line tool that uses the Decision-1 model through the TypeSafe SDK
-to categorize uncategorized emails in your Classic Outlook Inbox.
+to categorize uncategorized emails in your Classic Outlook Inbox or events in
+your default Calendar.
 
 ## Requirements
 
@@ -37,14 +38,34 @@ python .\outlook-categorizer.py `
 The script runs `az login` for the specified tenant before accessing Outlook.
 Both dates are inclusive and use your Windows local time zone.
 
-- Processes emails in the default Inbox only, not subfolders.
-- Skips emails that already have a category.
-- Assigns and saves one configured category per email.
+- Processes default Inbox emails without `--process-calendar`, or default Calendar
+  events with it, never both. Subfolders are not scanned.
+- Skips items that already have a category.
+- Assigns and saves one configured category per item.
 - Prints the category, model confidence, and a summary of results.
 
-**Important:** This modifies emails directly; there is no dry-run mode. The
+### Calendar events
+
+Add `--process-calendar` to the command above to process the default Calendar
+**instead of Inbox emails**. Without this flag, only Inbox emails are processed.
+
+Calendar events are selected when they overlap any part of the inclusive
+`--start-date` to `--end-date` range, based on their start/end times rather than
+when they were received or created. This includes all-day and multi-day events
+that began before `--start-date` but are still underway. An event ending exactly
+at midnight at the start of the range, or starting at midnight after `--end-date`,
+is excluded.
+
+Recurring occurrences within the range are processed individually, not the
+entire series. Shared calendars and Calendar subfolders are not scanned.
+Existing event categories are preserved.
+
+**Important:** This modifies items directly in the selected processing mode;
+there is no dry-run mode. For emails, the
 sender's email address, subject, and first 1,024 characters of the body are sent to
-the configured model endpoint. Use only an endpoint approved for your email data.
+the configured model endpoint. For calendar events, the organizer name, subject,
+start/end times, all-day status, location, and first 1,024 body characters are sent.
+Use only an endpoint approved for your email and calendar data.
 
 ## Categories
 
@@ -60,5 +81,13 @@ For all command-line options:
 python .\outlook-categorizer.py --help
 ```
 
-Exit codes: `0` for success, `1` for login, setup, or email errors, and `2` for
+Exit codes: `0` for success, `1` for login, setup, or item errors, and `2` for
 invalid command-line arguments.
+
+## Tests
+
+Run the mocked tests without accessing Outlook or Azure:
+
+```powershell
+python -B -m unittest discover -v
+```

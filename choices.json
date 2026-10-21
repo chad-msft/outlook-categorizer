@@ -7,7 +7,7 @@
       "Low Importance": "Content of low importance and is considered 'Low Importance'.",
       "Super Important": "Content that needs immediate attention and is considered 'Super Important'.",
       "Personal": "Content that is considered 'Personal'.",
-      "Important": "Content that is considered important.",
+      "Important": "Content that is considered important. Include any meeting that involves a customer",
       "Daily": "Content that is related to daily activities or matters.",
       "Internal Management": "Content that is from an internal email and related to internal Microsoft management or administrative matters.",
       "Internal Memo": "Content that is from an internal email and related to internal Microsoft content or information.",
